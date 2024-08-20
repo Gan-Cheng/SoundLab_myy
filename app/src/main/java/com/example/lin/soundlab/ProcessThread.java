@@ -6,11 +6,20 @@ import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import biz.source_code.dsp.filter.FilterPassType;
 import biz.source_code.dsp.filter.IirFilter;
 import biz.source_code.dsp.filter.IirFilterDesignExstrom;
 import biz.source_code.dsp.filter.IirFilterCoefficients;
+import org.jtransforms.fft.DoubleFFT_1D;
 
 public class ProcessThread implements Runnable {
     private static final String TAG = "SoundLabProcessThread";
@@ -25,8 +34,8 @@ public class ProcessThread implements Runnable {
     private static int processBufferDataSize = samplingRate/processFrequency;
     private static short[] processBufferData = new short[processBufferDataSize];
     private static double[] processBufferDataDouble = new double[processBufferDataSize];
-    private static double[] processBufferDataDoubleL = new double[processBufferDataSize];
-    private static double[] processBufferDataDoubleR = new double[processBufferDataSize];
+    private static double[] processBufferDataDoubleL = new double[processBufferDataSize/2];
+    private static double[] processBufferDataDoubleR = new double[processBufferDataSize/2];
 
     private static int channel;
 
@@ -40,12 +49,13 @@ public class ProcessThread implements Runnable {
     private ProgressBar progressbarBufferUsage;
     private TextView textviewBufferUsage;
 
-
-
+    private double[] modelSignal;
+    private double[] queueData;
+    private DoubleFFT_1D fft;
     private Button buttonPlayStart;
     private Button buttonPlayReset;
     private TextView textviewPlayStatus;
-    private int volumeThreshold = 20; // 40
+    private int volumeThreshold = 25; // 40
 
 
     @Override
@@ -64,6 +74,28 @@ public class ProcessThread implements Runnable {
 
     public void setup(Activity activity, int recordChannel, int recordSamplingRate) {
         superActivity = activity;
+
+
+        List<Double> doubleList = new ArrayList<>();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(superActivity.getResources().getAssets().open("ZCU1.txt")))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                doubleList.add(Double.parseDouble(line));
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        // 将List转换为double数组
+        modelSignal = new double[doubleList.size()*2];
+        for (int i = 0; i < doubleList.size(); i++) {
+            modelSignal[2 * i] = doubleList.get(i);
+            modelSignal[2 * i + 1] = 0.0;       // 虚部为 0
+        }
+        fft = new DoubleFFT_1D(doubleList.size());
+        fft.complexForward(modelSignal);
+
+        LogThread.debugLog(0, TAG, "Model_Length: " + modelSignal.length +", Data="+modelSignal[0]+modelSignal[1]+modelSignal[2]);
+        queueData = new double[doubleList.size()*2];
 
         samplingRate = recordSamplingRate;
         processBufferDataSize = samplingRate/processFrequency;
@@ -117,7 +149,7 @@ public class ProcessThread implements Runnable {
 
             long sum = 0;
             for (int i = 0; i < processBufferDataSize;i++) {
-                sum += Math.pow(processBufferDataDoubleAfterFilter[i],2);
+                sum += (long) Math.pow(processBufferDataDoubleAfterFilter[i],2);
             }
             double mean = sum / (double) processBufferDataSize;
             double volume = 10 * Math.log10(mean);
@@ -127,11 +159,11 @@ public class ProcessThread implements Runnable {
             setVolume1(volumeWithCorrection);
             setVolume2(volumeWithCorrection);
 
-            tryPlayReset();
-
-            if (volume>volumeThreshold) {
-                replyZC();
-            }
+//            tryPlayReset();
+//
+//            if (volume>volumeThreshold) {
+//                replyZC();
+//            }
         }
         // STEREO mode
         if (channel == AudioFormat.CHANNEL_IN_STEREO) {
@@ -147,8 +179,10 @@ public class ProcessThread implements Runnable {
             long sum1 = 0;
             long sum2 = 0;
             for (int i = 0; i < processBufferDataSize/2;i++) {
-                sum1 += Math.pow(processBufferDataDoubleAfterFilterL[i],2);
-                sum2 += Math.pow(processBufferDataDoubleAfterFilterR[i],2);
+                sum1 += (long) Math.pow(processBufferDataDoubleAfterFilterL[i],2);
+                sum2 += (long) Math.pow(processBufferDataDoubleAfterFilterR[i],2);
+//                queueData[2 * i] = processBufferDataDoubleAfterFilterR[i];
+//                queueData[2 * i + 1] = 0.0;
 //                LogThread.debugLog(0, TAG, "short1: " + processBufferData[i] + "  short2: " + processBufferData[i+1]);
             }
 
@@ -157,19 +191,58 @@ public class ProcessThread implements Runnable {
             double volume1WithCorrection = volumeCorrection(volume1);
             double volume2WithCorrection = volumeCorrection(volume2);
             LogThread.debugLog(0, TAG, "volume1: " + volume1WithCorrection + "  volume2: " + volume2WithCorrection);
+            LogThread.debugLog(0, TAG, "Length: " + processBufferDataDoubleAfterFilterR.length );
             setVolume1(volume1WithCorrection);
             setVolume2(volume2WithCorrection);
             setTotalVolume((volume1WithCorrection+volume2WithCorrection)/2);
 
 
+//            boolean Dddd = DetectZC(processBufferDataDoubleAfterFilterR);
 
-
-            tryPlayReset();
-            if (volume1>volumeThreshold | volume2>volumeThreshold) {
+//            tryPlayReset();
+            if ( (volume2>volumeThreshold || volume1>volumeThreshold) && DetectZC(processBufferDataDoubleAfterFilterR)) {
                 replyZC();
             }
         }
 
+    }
+
+    public boolean DetectZC(double[] dataR) {
+        int n = dataR.length;
+
+        for (int i = 0; i < dataR.length; i++) {
+            queueData[2 * i] = dataR[i];
+            queueData[2 * i + 1] = 0.0;       // 虚部为 0
+        }
+
+        fft.complexForward(queueData);
+
+        // 共轭相乘
+        double[] result = new double[queueData.length];
+        for (int i = 0; i < queueData.length; i += 2) {
+            double realA = queueData[i];
+            double imagA = queueData[i + 1];
+            double realB = modelSignal[i];
+            double imagB = modelSignal[i + 1];
+
+            // 共轭相乘: (realA + imagA*i) * (realB - imagB*i)
+            queueData[i] = realA * realB + imagA * imagB;        // 实部
+            queueData[i + 1] = imagA * realB - realA * imagB;    // 虚部
+        }
+
+        // 进行逆FFT变换
+        fft.complexInverse(queueData, true);
+
+        double sum1 = 0;
+        double max1 = 0;
+        for (int i = 0; i < queueData.length; i += 2) {
+            double absvalue = Math.abs(queueData[i]);
+            sum1 += absvalue;
+            max1 = Math.max(max1, absvalue);
+        }
+        LogThread.debugLog(2,TAG, "Metric: " + max1 / (sum1 / dataR.length));
+
+        return max1 / (sum1 / dataR.length) > 10;
     }
 
     public synchronized static boolean write(byte[] data) {
